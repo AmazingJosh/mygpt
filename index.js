@@ -135,6 +135,8 @@ async function callGeminiWithRetry(history) {
       await sleep(delay);
     }
   }
+    console.log("Using Gemini Key:", GEMINI_API_KEY?.slice(0, 10) + "...");
+
 
   throw lastError;
 }
@@ -165,7 +167,15 @@ async function getGeminiReply(from, text) {
 }
 
 // Helper to send a WhatsApp message back to user
+// Helper to send a WhatsApp message back to user
 async function sendWhatsAppMessage(to, message) {
+
+console.log("---- WHATSAPP DEBUG ----");
+  console.log("Token exists:", !!WHATSAPP_TOKEN);
+  console.log("Token preview:", WHATSAPP_TOKEN?.slice(0, 12));
+  console.log("Phone ID:", WHATSAPP_PHONE_NUMBER_ID);
+  console.log("------------------------");
+
   await axios.post(
     `https://graph.facebook.com/v19.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
     {
