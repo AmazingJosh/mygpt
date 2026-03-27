@@ -15,6 +15,10 @@ const MAX_HISTORY = 30;
 const MAX_MESSAGE_LENGTH = 1000;
 const REQUEST_TIMEOUT_MS = 15000;
 
+// Retry configuration
+const MAX_RETRIES = 3;          // total attempts
+const RETRY_BASE_DELAY_MS = 2000; // start with 2 seconds, then 4, then 8
+
 const conversations = {};
 
 // System personality
@@ -64,33 +68,100 @@ function trimHistory(history) {
   }
 }
 
+// Sleep helper — pauses execution for a given number of milliseconds
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Determines if an error is worth retrying or a definite failure
+function isRetryable(err) {
+  // Network issues, timeouts — worth retrying
+  if (err.code === 'ECONNABORTED') return true;  // timeout
+  if (err.code === 'ECONNRESET') return true;     // connection reset
+  if (err.code === 'ENOTFOUND') return true;      // DNS issue
+  if (err.code === 'ETIMEDOUT') return true;      // timed out
+
+  // Gemini server errors (5xx) — worth retrying (their problem, not ours)
+  if (err.response?.status >= 500) return true;
+
+  // Gemini rate limit (429) — worth retrying after a delay
+  if (err.response?.status === 429) return true;
+
+  // Everything else (400 bad request, 401 auth failed etc) — don't retry,
+  // these won't fix themselves
+  return false;
+}
+
+// Call Gemini API with retry logic
+async function callGeminiWithRetry(history) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+        { systemInstruction: SYSTEM_INSTRUCTION, contents: history },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': GEMINI_API_KEY
+          },
+          timeout: REQUEST_TIMEOUT_MS
+        }
+      );
+
+      // Success — return the reply
+      return response.data.candidates?.[0]?.content?.parts?.[0]?.text ||
+        "Hmm... something went wrong.";
+
+    } catch (err) {
+      lastError = err;
+
+      // If it's not a retryable error, fail immediately — no point waiting
+      if (!isRetryable(err)) {
+        console.error(`❌ Non-retryable error on attempt ${attempt}:`, err.response?.status, err.message);
+        throw err;
+      }
+
+      // If we've used all attempts, give up
+      if (attempt === MAX_RETRIES) {
+        console.error(`❌ All ${MAX_RETRIES} attempts failed. Last error:`, err.message);
+        throw err;
+      }
+
+      // Calculate delay: attempt 1 → 2s, attempt 2 → 4s, attempt 3 → 8s
+      const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      console.log(`⚠️ Attempt ${attempt} failed. Retrying in ${delay / 1000}s... (${err.message})`);
+      await sleep(delay);
+    }
+  }
+
+  throw lastError;
+}
+
 // Helper to get Gemini reply
 async function getGeminiReply(from, text) {
   if (isGreeting(text)) conversations[from] = [];
 
   const history = getConversation(from);
+
+  // Add user message to history
   history.push({ role: "user", parts: [{ text }] });
 
-  const response = await axios.post(
-    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-    { systemInstruction: SYSTEM_INSTRUCTION, contents: history },
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': GEMINI_API_KEY
-      },
-      timeout: REQUEST_TIMEOUT_MS
-    }
-  );
+  try {
+    const reply = await callGeminiWithRetry(history);
 
-  const reply =
-    response.data.candidates?.[0]?.content?.parts?.[0]?.text ||
-    "Hmm... something went wrong.";
+    // Only save to history if we got a real reply
+    history.push({ role: "model", parts: [{ text: reply }] });
+    trimHistory(history);
 
-  history.push({ role: "model", parts: [{ text: reply }] });
-  trimHistory(history);
-
-  return reply;
+    return reply;
+  } catch (err) {
+    // Remove the user message we just added since it didn't get a reply
+    // This keeps history clean — no orphaned user messages
+    history.pop();
+    throw err;
+  }
 }
 
 // Helper to send a WhatsApp message back to user
@@ -124,7 +195,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// WhatsApp webhook verification (Meta calls this when you register the webhook)
+// WhatsApp webhook verification
 app.get('/webhook', (req, res) => {
   const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
   const mode = req.query['hub.mode'];
@@ -147,21 +218,18 @@ app.post('/webhook', async (req, res) => {
 
   const body = req.body;
 
-  // Confirm it's a WhatsApp event
   if (body.object !== 'whatsapp_business_account') return;
 
   const changes = body.entry?.[0]?.changes?.[0]?.value;
   const message = changes?.messages?.[0];
 
-  // Only handle plain text messages (ignore images, voice notes, stickers etc)
   if (!message || message.type !== 'text') return;
 
-  const from = message.from;        // sender's phone number e.g. 2348012345678
-  const text = message.text.body;   // the actual message text
+  const from = message.from;
+  const text = message.text.body;
 
   console.log(`📩 Message from ${from}: ${text}`);
 
-  // Ignore messages that are too long
   if (text.length > MAX_MESSAGE_LENGTH) {
     await sendWhatsAppMessage(from, `Please keep messages under ${MAX_MESSAGE_LENGTH} characters.`);
     return;
@@ -172,12 +240,13 @@ app.post('/webhook', async (req, res) => {
     await sendWhatsAppMessage(from, reply);
     console.log(`✅ Reply sent to ${from}`);
   } catch (err) {
-    console.error("Error:", err.message);
-    await sendWhatsAppMessage(from, "Sorry, I ran into an issue. Please try again!");
+    // Only send error message to user if ALL retries failed
+    console.error("❌ All retries exhausted:", err.message);
+    await sendWhatsAppMessage(from, "Sorry, I'm having trouble responding right now. Please try again in a moment!");
   }
 });
 
-// Manual test route — lets you test without WhatsApp
+// Manual test route
 app.post('/message', messageLimiter, async (req, res) => {
   const { from, text } = req.body;
 
