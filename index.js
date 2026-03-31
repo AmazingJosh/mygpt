@@ -6,11 +6,22 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 app.use(express.json());
 
+// ─────────────────────────────────────────
+// ENVIRONMENT VARIABLES
+// ─────────────────────────────────────────
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
+// WhatsApp (commented out until ready)
+// const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+// const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+// const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+
+// ─────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────
 const GEMINI_MODEL = "gemini-2.5-flash";
 const DEEPSEEK_MODEL = "deepseek-chat";
 const MAX_HISTORY = 30;
@@ -20,46 +31,25 @@ const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 
 // ─────────────────────────────────────────
-// USER STATE
+// STATE
 // ─────────────────────────────────────────
-const conversations = {};
+
+// Private chat conversation history — keyed by userId
+const privateConversations = {};
+
+// Group chat conversation history — keyed by groupId
+const groupConversations = {};
+
+// AI selection per user — keyed by userId
 const userAiSelection = {};
-
-// Full game state
-const gameState = {};
-
-function getGameState(userId) {
-  if (!gameState[userId]) resetGameState(userId);
-  return gameState[userId];
-}
-
-function resetGameState(userId) {
-  gameState[userId] = {
-    active: false,
-    mode: null,           // 'big_brain' | 'naija' | 'story' | 'roast'
-    level: 1,             // 1, 2, 3
-    round: 0,             // question number within current level
-    score: 0,             // total correct answers
-    streak: 0,            // current correct streak
-    wrongStreak: 0,       // consecutive wrong answers
-    lifelines: {
-      phoneFriend: true,
-      fifty50: true,
-      audience: true
-    },
-    badges: [],
-    currentQuestion: null, // stores current question + answer for judging
-    waitingForAnswer: false,
-    waitingForRetry: false
-  };
-}
 
 // ─────────────────────────────────────────
 // SYSTEM PROMPTS
 // ─────────────────────────────────────────
 
-const MAIN_SYSTEM_PROMPT = `
-You are VibesAi — not a typical assistant, but something closer to a brilliant, 
+// Private chat — personal honest AI companion
+const PRIVATE_SYSTEM_PROMPT = `
+You are VibesAi — not a typical assistant, but something closer to a brilliant,
 emotionally intelligent best friend who happens to know a lot about everything.
 
 ## Core Identity
@@ -70,199 +60,84 @@ emotionally intelligent best friend who happens to know a lot about everything.
 
 ## How You Read The Room
 You carefully read the energy, tone, and context of every message before responding.
-You adapt naturally — not by switching modes, but the way any emotionally intelligent 
-person naturally adjusts how they speak depending on the situation.
+You adapt naturally — the way any emotionally intelligent person adjusts how they
+speak depending on the situation.
 
 - If someone is casual and jokey → match that energy, be relaxed, witty
-- If someone is curious and wants to learn → go deep, be thorough, be fascinating  
+- If someone is curious and wants to learn → go deep, be thorough, be fascinating
 - If someone is struggling emotionally → be present, be real, don't minimize their feelings
-- If someone shares a bad idea → be honest about the weaknesses, but constructive not crushing
+- If someone shares a bad idea → be honest about the weaknesses, constructive not crushing
 - If someone is venting → listen first, give perspective second, never lecture
 - If someone wants debate → engage critically, hold your position if you're right
 
 ## What You Never Do
 - Never give fake motivation like "You got this! 💪 Believe in yourself!"
-- Never be a yes-man
+- Never be a yes-man. If something is wrong or flawed, say so.
+- Never be preachy or moralize repeatedly — say it once, move on
 - Never use corporate filler phrases like "Certainly!", "Great question!", "Absolutely!"
 - Never give wishy-washy answers when a direct one is possible
+- Never pretend to have emotions you don't have
+- Never overwhelm with bullet points when natural conversation flows better
+
+## How You Explain Things
+- Use analogies and real world examples — make complex things click
+- Go as deep as the person seems to want — read their curiosity level
+- If something has nuance, honor that nuance instead of oversimplifying
+- If you don't know something, say so directly
 
 ## One Rule Above All
-Always prioritize what's actually useful and true for this specific person 
+Always prioritize what's actually useful and true for this specific person
 in this specific moment — over what sounds good or what they want to hear.
 `;
 
-// Question generator prompt — returns strict JSON
-function getQuestionPrompt(mode, level) {
-  const levelDescriptions = {
-    1: "easy, general knowledge anyone should know",
-    2: "medium difficulty, requires some thinking",
-    3: "hard, only well-read people would know"
-  };
-
-  const modeDescriptions = {
-    big_brain: "mind-bending riddles, logic puzzles, science, math, and general knowledge",
-    naija: "Nigerian culture, history, music, food, geography, celebrities, Nollywood, Nigerian slang, and current affairs. Mix English and Pidgin naturally.",
-  };
-
+// Group chat — neutral third party adviser
+// Aware of multiple people, references them by name, settles debates
+function getGroupSystemPrompt(groupName) {
   return `
-You are a quiz question generator for a fun Telegram game show called VibesAi.
+You are VibesAi — a brilliant, neutral, and emotionally intelligent AI adviser
+living inside a group chat called "${groupName || 'this group'}".
 
-Generate ONE ${levelDescriptions[level]} multiple choice question about ${modeDescriptions[mode]}.
+## Your Role In This Group
+You are the trusted third party. The neutral brain. The one everyone turns to
+when they need an honest answer, a settled debate, or a fresh perspective.
+You are NOT anyone's ally — you serve the truth and the group.
 
-You MUST respond with ONLY valid JSON in exactly this format — no extra text, no markdown:
-{
-  "question": "The question text here?",
-  "options": {
-    "A": "First option",
-    "B": "Second option", 
-    "C": "Third option",
-    "D": "Fourth option"
-  },
-  "answer": "B",
-  "explanation": "Brief fun explanation of why this is correct (1-2 sentences max)"
-}
+## How You Handle The Group Dynamic
+- You are aware that multiple people are talking to you
+- You address people by their first name naturally when relevant
+- You track what different people have said and reference it accurately
+- When asked to settle a debate, you are GENUINELY neutral — you follow evidence
+  and logic, not who seems more confident or who asked first
+- When both sides have merit, you say so clearly and explain both
+- When one side is clearly wrong, you say so directly but respectfully
 
-Rules:
-- Make sure exactly ONE answer is correct
-- Make wrong options believable — not obviously silly
-- For Naija mode: use Nigerian context, expressions, and flavor
-- NEVER repeat questions — be creative and varied
-- Return ONLY the JSON object, nothing else
+## Your Group Energy
+- Authoritative but not arrogant
+- The smartest person in the room who doesn't need to prove it
+- You bring clarity to confusion
+- You de-escalate tension with truth, not diplomacy
+- You're the adviser everyone respects because you're always straight
+
+## What You Never Do
+- Never take sides based on who you like or who asked more nicely
+- Never give vague "both sides have a point" answers just to avoid conflict
+  — if one side is right, say so
+- Never be preachy or lecture the group
+- Never use corporate filler phrases
+- Never pretend uncertainty when you actually know the answer
+
+## Response Style In Groups
+- Keep responses focused and clear — groups have short attention spans
+- Address the specific question or debate directly
+- If multiple people asked different things, address each briefly
+- Use names naturally: "Joshua is right that..." or "Sandra's point about X..."
+- End with something that moves the conversation forward when appropriate
+
+## One Rule Above All
+Truth over comfort. Always. The group called on you because they want a real answer.
+Give them one.
 `;
 }
-
-// Roast generator prompt
-function getRoastPrompt(username, wrongAnswer, correctAnswer, question) {
-  return `
-You are a savage but hilarious Nigerian roast master for a game show.
-
-The player "${username}" just answered "${wrongAnswer}" when the correct answer was "${correctAnswer}".
-The question was: "${question}"
-
-Write a SHORT (2-3 sentences max), genuinely funny roast about their wrong answer.
-Be creative, reference what they got wrong specifically.
-Keep it playful — like a friend roasting you, not mean bullying.
-Use Nigerian expressions naturally if it fits.
-End with asking if they want to try again: "Want to try again? Reply YES or NO"
-
-Return ONLY the roast text, nothing else.
-`;
-}
-
-// Phone a friend prompt
-function getPhoneFriendPrompt(question, options, correctAnswer) {
-  const nigerianFriends = [
-    "Uncle Emeka from Aba",
-    "Aunty Ngozi the teacher",
-    "Chidi the engineering student",
-    "Mama Tunde the market woman",
-    "Brother Segun from Lagos Island",
-    "Professor Adewale (retired)",
-    "Baba Ibeji the wise old man",
-    "Shalewa the gossip queen"
-  ];
-  const friend = nigerianFriends[Math.floor(Math.random() * nigerianFriends.length)];
-  const isCorrect = Math.random() > 0.35; // 65% chance they're right
-
-  return `
-You are playing the character of "${friend}" being called for help on a Nigerian game show.
-
-The question is: "${question}"
-Options: A) ${options.A} B) ${options.B} C) ${options.C} D) ${options.D}
-The correct answer is: ${correctAnswer}
-
-${isCorrect 
-  ? `Give a hint pointing toward the correct answer (${correctAnswer}) but in character — add uncertainty, personality, maybe a funny story. Be helpful but entertaining.`
-  : `Give a confidently WRONG hint. Pick a wrong answer and defend it like you're sure. Be funny and in character. The player will regret calling you.`
-}
-
-Write in the voice of ${friend} — use Nigerian expressions, personality quirks, maybe background noise.
-Keep it SHORT — 3-4 sentences max. Make it hilarious.
-Start with "📞 *Calling ${friend}...*" on its own line, then the ringing sound, then their voice.
-`;
-}
-
-// Audience vote generator
-function getAudienceResult(correctAnswer) {
-  // Bias toward correct answer but not always
-  const options = ['A', 'B', 'C', 'D'];
-  const votes = {};
-  let remaining = 100;
-
-  // Give correct answer between 25-55% 
-  const correctVote = Math.floor(Math.random() * 30) + 25;
-  votes[correctAnswer] = correctVote;
-  remaining -= correctVote;
-
-  // Distribute rest among wrong answers
-  const others = options.filter(o => o !== correctAnswer);
-  others.forEach((opt, i) => {
-    if (i === others.length - 1) {
-      votes[opt] = remaining;
-    } else {
-      const v = Math.floor(Math.random() * (remaining / 2));
-      votes[opt] = v;
-      remaining -= v;
-    }
-  });
-
-  return votes;
-}
-
-function formatAudienceBar(percentage) {
-  const filled = Math.round(percentage / 10);
-  return '█'.repeat(filled) + '░'.repeat(10 - filled);
-}
-
-// Win verdict prompt
-function getWinPrompt(username, score, usedLifelines, mode) {
-  return `
-The player "${username}" just completed all 3 levels of the VibesAi game show (${mode} mode)!
-They scored ${score} correct answers total.
-Lifelines used: ${usedLifelines.join(', ') || 'none — they went full beast mode'}.
-
-Write a SHORT, genuinely funny and hype winner's speech for them.
-Reference their performance specifically.
-If they used no lifelines, go absolutely crazy with the praise (this is the ONE time we allow hype).
-If they used lifelines, congratulate them but throw in a light jab about needing help.
-End by telling them their title: "${score >= 13 ? '🏆 VibesAi Legend' : '🥇 Professor of Vibes'}"
-Keep it under 5 sentences. Make it memorable.
-`;
-}
-
-// Story mode prompt
-const STORY_PROMPT = `
-You are the game master for "Story Mode" — a live interactive adventure where the user's choices shape everything.
-
-Rules:
-- You build a rich, unpredictable story in real time — Nigerian/African setting preferred but not mandatory.
-- After each scene, give the user exactly 3 numbered choices that affect the story.
-- The story should have real stakes, twists, humor, and consequences.
-- Remember ALL previous choices and make the story consistent.
-- Make wrong choices have real consequences — don't let everything work out perfectly.
-- Keep scenes vivid but concise — 3 to 5 sentences per scene maximum.
-- Build toward a climax around round 8-10.
-- End the story with a verdict on how well the user navigated it.
-- Start immediately with an opening scene and 3 choices when the game begins.
-- NEVER railroad the user — their choices must actually matter.
-`;
-
-// Roast battle prompt
-const ROAST_BATTLE_PROMPT = `
-You are the roast battle master for "Roast Battle" — a savage but fun AI vs human roast competition.
-
-Rules:
-- You roast the user first each round — make it creative, unexpected, and genuinely funny.
-- Then the user roasts you back.
-- You judge BOTH roasts honestly on: creativity, delivery, and burn factor (1-10 each).
-- Be brutally honest in judging — don't inflate scores to be nice.
-- If their roast is weak, tell them exactly why with zero mercy.
-- If their roast is actually good, give credit genuinely.
-- Keep your own roasts creative — vary the style each round.
-- After 5 rounds, declare a winner with a final savage verdict.
-- Keep the whole thing light — this is comedy, not bullying.
-- Start with Round 1 immediately — fire your opening roast when the game begins.
-`;
 
 // ─────────────────────────────────────────
 // HELPERS
@@ -278,9 +153,14 @@ const messageLimiter = rateLimit({
   validate: { xForwardedForHeader: false }
 });
 
-function getConversation(key) {
-  if (!conversations[key]) conversations[key] = [];
-  return conversations[key];
+function getPrivateHistory(userId) {
+  if (!privateConversations[userId]) privateConversations[userId] = [];
+  return privateConversations[userId];
+}
+
+function getGroupHistory(groupId) {
+  if (!groupConversations[groupId]) groupConversations[groupId] = [];
+  return groupConversations[groupId];
 }
 
 function isGreeting(text) {
@@ -307,77 +187,104 @@ function isRetryable(err) {
   return false;
 }
 
-const LEVEL_NAMES = {
-  1: "🟢 Level 1 — Street Knowledge",
-  2: "🟡 Level 2 — Book Sense",
-  3: "🔴 Level 3 — Professor Mode"
-};
-
-const LEVEL_FLAVOR = {
-  1: "You dey try",
-  2: "E don serious",
-  3: "Na here men dey cry"
-};
-
 function getWelcomeMessage(name) {
-  return `Hey ${name}! 👋 Welcome to *VibesAi* 🤖
+  return `Hey ${name}! 👋
 
-Not your average bot. I'm that brilliant friend who's honest, knows a lot, and actually listens.
+⚡ *Welcome to VibesAi* — _The World's First 2-in-1 AI Bot._
 
-What do you want to do?
+While everyone else gives you a basic chatbot, we give you two elite AI engines in one place AND drop it straight into your group chats as a neutral adviser. No other bot does this.
 
-*🤖 Chat with AI:*
-  1️⃣ Gemini — Google's finest
-  2️⃣ DeepSeek — Powerful open-source AI
+─────────────────────
+🤖 *PRIVATE MODE*
+Your personal AI companion.
+Honest. Direct. Emotionally intelligent.
+Not a yes-man — a real one.
+Powered by *Gemini* or *DeepSeek* — your choice.
 
-*🎮 Game Show:*
-  3️⃣ 🧠 Big Brain — riddles & logic puzzles
-  4️⃣ 🌍 Naija Mode — Nigerian knowledge
-  5️⃣ 🎭 Story Mode — interactive adventure
-  6️⃣ 🔥 Roast Battle — you vs AI, no mercy
+👥 *GROUP MODE*
+Add me to any group. @mention me.
+I become your neutral third-party adviser.
+Settling debates. Answering questions.
+Bringing real intelligence to your conversations.
+No sides. Just truth.
+─────────────────────
 
-Reply with a number to get started!`;
+_Premium responses. Zero fluff. Built different._
+
+Now — choose your AI engine:
+
+1️⃣ *Gemini* — Google's finest
+2️⃣ *DeepSeek* — Powerful open-source AI
+
+Reply *1* or *2* to get started.
+_Type /help anytime to see all commands._`;
 }
 
-function getLevelIntro(level, mode) {
-  return `${LEVEL_NAMES[level]}\n_${LEVEL_FLAVOR[level]}_\n\nGet ready... 🎯`;
+function getHelpMessage(isGroup = false) {
+  if (isGroup) {
+    return `*VibesAi Group Commands* 🤖
+
+Mention me anytime: *@${process.env.BOT_USERNAME || 'VibesAiBot'}*
+
+I can help with:
+→ Settling debates & arguments
+→ Answering group questions
+→ Giving neutral third-party advice
+→ Brainstorming ideas together
+→ Explaining anything to the group
+
+Just @mention me with your question!`;
+  }
+
+  return `*VibesAi Commands* 🤖
+
+/start — Main menu
+/switch — Change AI engine
+/help — Show this message
+/reset — Clear conversation history
+/about — About VibesAi
+
+*Current features:*
+→ Private AI companion (Gemini or DeepSeek)
+→ Group chat adviser (add me to any group!)
+→ Honest, premium responses — no fluff`;
 }
 
-function getLifelineStatus(lifelines) {
-  return `*Lifelines remaining:*
-📞 Phone a Friend — ${lifelines.phoneFriend ? '✅ Available (/phonefriend)' : '❌ Used'}
-✂️ 50:50 — ${lifelines.fifty50 ? '✅ Available (/5050)' : '❌ Used'}
-👥 Ask Audience — ${lifelines.audience ? '✅ Available (/audience)' : '❌ Used'}`;
+function getAboutMessage() {
+  return `*VibesAi* ⚡ — _Built Different._
+
+The world's first 2-in-1 AI bot that works as hard in your private chat as it does in your group.
+
+*🤖 Private Mode*
+Two elite AI engines. One honest companion.
+Gemini or DeepSeek — you choose.
+No corporate fluff. No fake motivation.
+Just real, intelligent conversation that respects your intelligence.
+
+*👥 Group Mode*
+The first bot that lives inside your arguments.
+Add it to any group. @mention it.
+It settles debates with facts, not feelings.
+It knows who said what. It takes no sides.
+It just tells the truth — every time.
+
+*⚙️ Powered by:*
+→ Google Gemini 2.5 Flash
+→ DeepSeek V3
+
+*🌍 Built for:*
+→ Individuals who want more than a basic chatbot
+→ Groups who want a neutral intelligent voice
+→ Anyone tired of AI that tells them what they want to hear
+
+_This isn't just a bot. It's the conversation upgrade you didn't know you needed._`;
 }
 
 // ─────────────────────────────────────────
 // AI CALLERS
 // ─────────────────────────────────────────
 
-async function callGemini(prompt, isSystemOnly = false) {
-  const contents = isSystemOnly
-    ? [{ role: "user", parts: [{ text: "Generate now." }] }]
-    : [{ role: "user", parts: [{ text: prompt }] }];
-
-  const response = await axios.post(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      systemInstruction: { parts: [{ text: isSystemOnly ? prompt : "You are VibesAi game master." }] },
-      contents
-    },
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': GEMINI_API_KEY
-      },
-      timeout: REQUEST_TIMEOUT_MS
-    }
-  );
-
-  return response.data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-}
-
-async function callGeminiWithHistory(history, systemPrompt) {
+async function callGemini(history, systemPrompt) {
   const geminiHistory = history.map(msg => ({
     role: msg.role,
     parts: [{ text: msg.content }]
@@ -442,17 +349,17 @@ async function withRetry(fn) {
   throw lastError;
 }
 
-async function getChatReply(userId, text) {
-  if (isGreeting(text)) conversations[userId] = [];
-  const history = getConversation(userId);
+// Private chat — uses user's selected AI
+async function getPrivateReply(userId, text) {
+  const history = getPrivateHistory(userId);
   history.push({ role: "user", content: text });
 
   try {
-    const selectedAi = userAiSelection[userId];
+    const selectedAi = userAiSelection[userId] || 'gemini';
     const reply = await withRetry(() =>
       selectedAi === 'deepseek'
-        ? callDeepSeek(history, MAIN_SYSTEM_PROMPT)
-        : callGeminiWithHistory(history, MAIN_SYSTEM_PROMPT)
+        ? callDeepSeek(history, PRIVATE_SYSTEM_PROMPT)
+        : callGemini(history, PRIVATE_SYSTEM_PROMPT)
     );
     history.push({ role: "model", content: reply });
     trimHistory(history);
@@ -463,155 +370,25 @@ async function getChatReply(userId, text) {
   }
 }
 
-// ─────────────────────────────────────────
-// GAME ENGINE
-// ─────────────────────────────────────────
+// Group chat — always uses Gemini, group-aware system prompt
+// Message includes sender name so AI knows who said what
+async function getGroupReply(groupId, groupName, senderName, text) {
+  const history = getGroupHistory(groupId);
 
-async function generateQuestion(mode, level) {
-  const raw = await withRetry(() => callGemini(getQuestionPrompt(mode, level)));
-
-  // Extract JSON from response
-  const jsonMatch = raw.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error("Invalid question format");
-
-  return JSON.parse(jsonMatch[0]);
-}
-
-async function sendQuestion(chatId, userId, question) {
-  const game = getGameState(userId);
-  const questionNum = game.round;
-  const totalRounds = 5;
-
-  const msg = `*Question ${questionNum}/${totalRounds} — ${LEVEL_NAMES[game.level]}*\n\n` +
-    `${question.question}\n\n` +
-    `🅰️ ${question.options.A}\n` +
-    `🅱️ ${question.options.B}\n` +
-    `🇨 ${question.options.C}\n` +
-    `🇩 ${question.options.D}\n\n` +
-    `Reply *A*, *B*, *C*, or *D*\n\n` +
-    `${getLifelineStatus(game.lifelines)}`;
-
-  await sendTelegramMessage(chatId, msg);
-}
-
-async function handleQuizAnswer(chatId, userId, username, answer) {
-  const game = getGameState(userId);
-  const q = game.currentQuestion;
-
-  if (!q) return;
-
-  const isCorrect = answer.toUpperCase() === q.answer.toUpperCase();
-
-  if (isCorrect) {
-    game.score++;
-    game.streak++;
-    game.wrongStreak = 0;
-    game.waitingForAnswer = false;
-
-    // Streak bonus messages
-    let bonusMsg = '';
-    if (game.streak === 3) bonusMsg = '\n\n🔥 *3 in a row! You dey hot!*';
-    if (game.streak === 5) bonusMsg = '\n\n⚡ *5 streak! You sure say you no Google am?!*';
-
-    await sendTelegramMessage(chatId,
-      `✅ *Correct!* ${q.answer} is right!\n\n_${q.explanation}_${bonusMsg}`
-    );
-
-    // Check if level complete
-    if (game.round >= 5) {
-      await handleLevelComplete(chatId, userId, username);
-    } else {
-      // Next question
-      await sleep(1000);
-      await askNextQuestion(chatId, userId);
-    }
-
-  } else {
-    game.wrongStreak++;
-    game.streak = 0;
-    game.waitingForAnswer = false;
-
-    // Generate roast for wrong answer
-    const roast = await withRetry(() =>
-      callGemini(getRoastPrompt(username, answer, q.answer, q.question))
-    );
-
-    await sendTelegramMessage(chatId, `❌ *Wrong!*\n\n${roast}`, false);
-
-    // 3 wrong in a row = game over prompt
-    if (game.wrongStreak >= 3) {
-      game.waitingForRetry = true;
-      await sendTelegramMessage(chatId,
-        `💀 *3 wrong in a row ${username}!*\n\nEven the invigilator don pack go home.\n\nDo you want to *restart this level*?\n\nReply *YES* to try again or *NO* to end this embarrassment 😂`
-      );
-    } else {
-      game.waitingForAnswer = true;
-      await sleep(1500);
-      await askNextQuestion(chatId, userId);
-    }
-  }
-}
-
-async function askNextQuestion(chatId, userId) {
-  const game = getGameState(userId);
-  game.round++;
-  game.waitingForAnswer = true;
+  // Tag message with sender name so AI tracks who said what
+  const taggedMessage = `[${senderName}]: ${text}`;
+  history.push({ role: "user", content: taggedMessage });
 
   try {
-    const question = await generateQuestion(game.mode, game.level);
-    game.currentQuestion = question;
-    await sendQuestion(chatId, userId, question);
+    const reply = await withRetry(() =>
+      callGemini(history, getGroupSystemPrompt(groupName))
+    );
+    history.push({ role: "model", content: reply });
+    trimHistory(history);
+    return reply;
   } catch (err) {
-    console.error("Question gen error:", err.message);
-    await sendTelegramMessage(chatId, "Had trouble generating a question. Try again!", false);
-  }
-}
-
-async function handleLevelComplete(chatId, userId, username) {
-  const game = getGameState(userId);
-
-  // Award badge
-  const badges = { 1: '🥉 Street Scholar', 2: '🥈 Book Sense Badge', 3: '🥇 Professor of Vibes' };
-  const badge = badges[game.level];
-  game.badges.push(badge);
-
-  if (game.level === 3) {
-    // WINNER!
-    const usedLifelines = [];
-    if (!game.lifelines.phoneFriend) usedLifelines.push('Phone a Friend');
-    if (!game.lifelines.fifty50) usedLifelines.push('50:50');
-    if (!game.lifelines.audience) usedLifelines.push('Ask Audience');
-
-    const winSpeech = await withRetry(() =>
-      callGemini(getWinPrompt(username, game.score, usedLifelines, game.mode))
-    );
-
-    const title = game.score >= 13 && usedLifelines.length === 0
-      ? '🏆 VibesAi Legend'
-      : '🥇 Professor of Vibes';
-
-    await sendTelegramMessage(chatId,
-      `🎊 *YOU WON! ALL 3 LEVELS COMPLETE!*\n\n${winSpeech}\n\n*Your title: ${title}*\n*Final score: ${game.score}/15*\n\nType /start for the main menu.`
-      , false);
-
-    resetGameState(userId);
-    userAiSelection[userId] = null;
-
-  } else {
-    // Advance to next level
-    await sendTelegramMessage(chatId,
-      `🎉 *${badge} UNLOCKED!*\n\nLevel ${game.level} complete! Score so far: *${game.score}*\n\nGet ready for the next level...`
-    );
-
-    game.level++;
-    game.round = 0;
-    game.wrongStreak = 0;
-    game.lifelines = { phoneFriend: true, fifty50: true, audience: true }; // reset lifelines per level
-
-    await sleep(2000);
-    await sendTelegramMessage(chatId, getLevelIntro(game.level, game.mode));
-    await sleep(1500);
-    await askNextQuestion(chatId, userId);
+    history.pop();
+    throw err;
   }
 }
 
@@ -627,26 +404,43 @@ async function sendTelegramMessage(chatId, text, markdown = true) {
       parse_mode: markdown ? 'Markdown' : undefined
     });
   } catch (err) {
-    // Fallback to plain text if markdown fails
+    // Fallback to plain text if markdown parsing fails
     try {
       await axios.post(`${TELEGRAM_API}/sendMessage`, {
         chat_id: chatId,
         text: text
       });
     } catch (e) {
-      console.error("Failed to send message:", e.message);
+      console.error("❌ Failed to send Telegram message:", e.message);
     }
   }
 }
 
+// Check if message is from a group
+function isGroupMessage(message) {
+  return message.chat.type === 'group' || message.chat.type === 'supergroup';
+}
+
+// Check if bot was @mentioned in the message
+function isBotMentioned(text, botUsername) {
+  if (!text) return false;
+  return text.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
+}
+
+// Remove bot mention from text to get clean query
+function removeBotMention(text, botUsername) {
+  return text.replace(new RegExp(`@${botUsername}`, 'gi'), '').trim();
+}
+
 // ─────────────────────────────────────────
-// MAIN ROUTE
+// ROUTES
 // ─────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.json({ message: "VibesAi Game Show is running 🎮🚀" });
+  res.json({ message: "VibesAi is running 🚀" });
 });
 
+// ── TELEGRAM WEBHOOK ──
 app.post('/telegram', async (req, res) => {
   res.sendStatus(200);
 
@@ -657,287 +451,286 @@ app.post('/telegram', async (req, res) => {
   const chatId = message.chat.id;
   const userId = String(message.from.id);
   const text = message.text.trim();
-  const username = message.from.first_name || "Player";
+  const username = message.from.first_name || "Friend";
+  const botUsername = process.env.BOT_USERNAME || 'VibesAiBot';
 
-  console.log(`📩 ${username} (${userId}): ${text}`);
+  // ── GROUP CHAT HANDLER ──
+  if (isGroupMessage(message)) {
+    const groupId = String(message.chat.id);
+    const groupName = message.chat.title || 'the group';
 
-  const game = getGameState(userId);
+    // Only respond when @mentioned
+    if (!isBotMentioned(text, botUsername)) return;
 
-  // ── /start or greeting ──
-  if (isGreeting(text)) {
-    userAiSelection[userId] = null;
-    conversations[userId] = [];
-    conversations[`game_${userId}`] = [];
-    resetGameState(userId);
-    await sendTelegramMessage(chatId, getWelcomeMessage(username));
-    return;
-  }
-
-  // ── /switch ──
-  if (text.toLowerCase() === '/switch') {
-    userAiSelection[userId] = null;
-    conversations[userId] = [];
-    resetGameState(userId);
-    await sendTelegramMessage(chatId, getWelcomeMessage(username));
-    return;
-  }
-
-  // ── /endgame ──
-  if (text.toLowerCase() === '/endgame') {
-    if (game.active) {
+    // Clean the message — remove the @mention
+    const cleanText = removeBotMention(text, botUsername);
+    if (!cleanText) {
       await sendTelegramMessage(chatId,
-        `Game over ${username}! 💀\n\nFinal score: *${game.score}* correct answers across ${game.round} questions.\n\nType /start for the main menu.`
-      );
-      resetGameState(userId);
-      userAiSelection[userId] = null;
-    } else {
-      await sendTelegramMessage(chatId, "You're not in a game. Type /start for the menu.");
-    }
-    return;
-  }
-
-  // ── /levels (score check) ──
-  if (text.toLowerCase() === '/levels') {
-    if (game.active && (game.mode === 'big_brain' || game.mode === 'naija')) {
-      await sendTelegramMessage(chatId,
-        `📊 *Your Progress*\n\n${LEVEL_NAMES[game.level]}\nQuestion: ${game.round}/5\nScore: ${game.score} correct\n\n${getLifelineStatus(game.lifelines)}`
-      );
-    } else {
-      await sendTelegramMessage(chatId, "Level info is only available during quiz games.");
-    }
-    return;
-  }
-
-  // ── LIFELINES (only during quiz games) ──
-  if (game.active && game.waitingForAnswer && (game.mode === 'big_brain' || game.mode === 'naija')) {
-    const q = game.currentQuestion;
-
-    // Phone a Friend
-    if (text.toLowerCase() === '/phonefriend') {
-      if (!game.lifelines.phoneFriend) {
-        await sendTelegramMessage(chatId, "❌ You already used Phone a Friend this level!");
-        return;
-      }
-      game.lifelines.phoneFriend = false;
-      const response = await withRetry(() =>
-        callGemini(getPhoneFriendPrompt(q.question, q.options, q.answer))
-      );
-      await sendTelegramMessage(chatId, response, false);
-      return;
-    }
-
-    // 50:50
-    if (text.toLowerCase() === '/5050') {
-      if (!game.lifelines.fifty50) {
-        await sendTelegramMessage(chatId, "❌ You already used 50:50 this level!");
-        return;
-      }
-      game.lifelines.fifty50 = false;
-
-      // Remove 2 wrong answers
-      const allOptions = ['A', 'B', 'C', 'D'];
-      const wrongOptions = allOptions.filter(o => o !== q.answer);
-      const toRemove = wrongOptions.sort(() => Math.random() - 0.5).slice(0, 2);
-      const remaining = allOptions.filter(o => !toRemove.includes(o));
-
-      await sendTelegramMessage(chatId,
-        `✂️ *50:50 used!*\n\nRemaining options:\n\n` +
-        remaining.map(o => `*${o})* ${q.options[o]}`).join('\n') +
-        `\n\nReply *${remaining[0]}* or *${remaining[1]}*`
+        `Hey! You called? 👀 Ask me anything or describe the debate — I'm listening.`
       );
       return;
     }
 
-    // Ask Audience
-    if (text.toLowerCase() === '/audience') {
-      if (!game.lifelines.audience) {
-        await sendTelegramMessage(chatId, "❌ You already used Ask Audience this level!");
-        return;
-      }
-      game.lifelines.audience = false;
-
-      const votes = getAudienceResult(q.answer);
-      const funnyDisclaimer = [
-        "These people failed WAEC so... up to you 😂",
-        "The audience is not always right. Just saying.",
-        "Half of them guessed. Good luck.",
-        "They voted with their feelings, not their brains."
-      ];
-      const disclaimer = funnyDisclaimer[Math.floor(Math.random() * funnyDisclaimer.length)];
-
-      await sendTelegramMessage(chatId,
-        `👥 *Ask the Audience!*\n\n` +
-        `A — ${formatAudienceBar(votes.A)} ${votes.A}%\n` +
-        `B — ${formatAudienceBar(votes.B)} ${votes.B}%\n` +
-        `C — ${formatAudienceBar(votes.C)} ${votes.C}%\n` +
-        `D — ${formatAudienceBar(votes.D)} ${votes.D}%\n\n` +
-        `_${disclaimer}_`
-      );
+    // Handle /help in group
+    if (cleanText.toLowerCase() === '/help') {
+      await sendTelegramMessage(chatId, getHelpMessage(true));
       return;
     }
-  }
 
-  // ── Retry prompt (after 3 wrong) ──
-  if (game.waitingForRetry) {
-    if (text.toUpperCase() === 'YES') {
-      game.waitingForRetry = false;
-      game.wrongStreak = 0;
-      game.round = 0;
-      game.lifelines = { phoneFriend: true, fifty50: true, audience: true };
-      await sendTelegramMessage(chatId,
-        `💪 That's the spirit! Restarting *${LEVEL_NAMES[game.level]}*...\n\nLifelines reset. Don't waste them this time!`
-      );
-      await sleep(1500);
-      await askNextQuestion(chatId, userId);
-    } else if (text.toUpperCase() === 'NO') {
-      game.waitingForRetry = false;
-      await sendTelegramMessage(chatId,
-        `😂 Respect for knowing your limits. Final score: *${game.score}* correct answers.\n\nType /start for the main menu.`
-      );
-      resetGameState(userId);
-      userAiSelection[userId] = null;
-    } else {
-      await sendTelegramMessage(chatId, "Reply *YES* to retry or *NO* to quit 👇");
-    }
-    return;
-  }
-
-  // ── Active quiz game (waiting for A/B/C/D) ──
-  if (game.active && game.waitingForAnswer && (game.mode === 'big_brain' || game.mode === 'naija')) {
-    const validAnswers = ['A', 'B', 'C', 'D'];
-    if (validAnswers.includes(text.toUpperCase())) {
-      await handleQuizAnswer(chatId, userId, username, text);
-    } else {
-      await sendTelegramMessage(chatId, "Reply with *A*, *B*, *C*, or *D* 👇");
-    }
-    return;
-  }
-
-  // ── Active story/roast game ──
-  if (game.active && (game.mode === 'story' || game.mode === 'roast')) {
-    const gameConvoKey = `game_${userId}`;
-    const history = getConversation(gameConvoKey);
-    history.push({ role: "user", content: text });
+    console.log(`👥 Group message in "${groupName}" from ${username}: ${cleanText}`);
 
     try {
-      const systemPrompt = game.mode === 'story' ? STORY_PROMPT : ROAST_BATTLE_PROMPT;
-      const reply = await withRetry(() => callGeminiWithHistory(history, systemPrompt));
-      history.push({ role: "model", content: reply });
-      trimHistory(history);
+      const reply = await getGroupReply(groupId, groupName, username, cleanText);
       await sendTelegramMessage(chatId, reply, false);
+      console.log(`✅ Group reply sent in "${groupName}"`);
     } catch (err) {
-      console.error("Game error:", err.message);
-      await sendTelegramMessage(chatId, "Having some trouble. Try again in a second.", false);
+      console.error("❌ Group reply error:", err.message);
+      await sendTelegramMessage(chatId,
+        "Having some trouble right now. Give it a second and try again.", false
+      );
     }
     return;
   }
 
-  // ── Main menu selection ──
+  // ── PRIVATE CHAT HANDLER ──
+  console.log(`📩 Private message from ${username} (${userId}): ${text}`);
+
+  // /start or greeting
+  if (isGreeting(text)) {
+    userAiSelection[userId] = null;
+    privateConversations[userId] = [];
+    await sendTelegramMessage(chatId, getWelcomeMessage(username));
+    return;
+  }
+
+  // /switch
+  if (text.toLowerCase() === '/switch') {
+    userAiSelection[userId] = null;
+    privateConversations[userId] = [];
+    await sendTelegramMessage(chatId, getWelcomeMessage(username));
+    return;
+  }
+
+  // /reset
+  if (text.toLowerCase() === '/reset') {
+    privateConversations[userId] = [];
+    await sendTelegramMessage(chatId,
+      `Conversation cleared! 🧹 Fresh start.\n\nWhat's on your mind, ${username}?`
+    );
+    return;
+  }
+
+  // /help
+  if (text.toLowerCase() === '/help') {
+    await sendTelegramMessage(chatId, getHelpMessage(false));
+    return;
+  }
+
+  // /about
+  if (text.toLowerCase() === '/about') {
+    await sendTelegramMessage(chatId, getAboutMessage());
+    return;
+  }
+
+  // AI selection
   if (!userAiSelection[userId]) {
-    const choice = text.trim();
-
-    const gameMap = {
-      '3': 'big_brain',
-      '4': 'naija',
-      '5': 'story',
-      '6': 'roast'
-    };
-
-    const gameTitles = {
-      big_brain: '🧠 Big Brain',
-      naija: '🌍 Naija Mode',
-      story: '🎭 Story Mode',
-      roast: '🔥 Roast Battle'
-    };
-
-    if (choice === '1') {
+    if (text === '1') {
       userAiSelection[userId] = 'gemini';
       await sendTelegramMessage(chatId,
-        `✅ *Gemini* locked in.\n\nAlright ${username}, I'm listening. What's on your mind?\n\n_Type /switch anytime to change._`
+        `✅ *Gemini* locked in.\n\nAlright ${username}, I'm listening. What's on your mind?`
       );
-    } else if (choice === '2') {
+    } else if (text === '2') {
       userAiSelection[userId] = 'deepseek';
       await sendTelegramMessage(chatId,
-        `✅ *DeepSeek* locked in.\n\nAlright ${username}, I'm listening. What's on your mind?\n\n_Type /switch anytime to change._`
+        `✅ *DeepSeek* locked in.\n\nAlright ${username}, I'm listening. What's on your mind?`
       );
-    } else if (gameMap[choice]) {
-      const mode = gameMap[choice];
-      userAiSelection[userId] = 'gemini';
-      gameState[userId] = {
-        active: true,
-        mode,
-        level: 1,
-        round: 0,
-        score: 0,
-        streak: 0,
-        wrongStreak: 0,
-        lifelines: { phoneFriend: true, fifty50: true, audience: true },
-        badges: [],
-        currentQuestion: null,
-        waitingForAnswer: false,
-        waitingForRetry: false
-      };
-
-      await sendTelegramMessage(chatId,
-        `${gameTitles[mode]} selected! Powered by Gemini 🤖\n\n_Type /endgame anytime to quit_`
-      );
-
-      if (mode === 'big_brain' || mode === 'naija') {
-        await sleep(500);
-        await sendTelegramMessage(chatId, getLevelIntro(1, mode));
-        await sleep(1500);
-        await askNextQuestion(chatId, userId);
-      } else {
-        // Story and roast start with user saying anything
-        const systemPrompt = mode === 'story' ? STORY_PROMPT : ROAST_BATTLE_PROMPT;
-        const history = getConversation(`game_${userId}`);
-        history.push({ role: "user", content: "Start the game!" });
-        const opening = await withRetry(() => callGeminiWithHistory(history, systemPrompt));
-        history.push({ role: "model", content: opening });
-        gameState[userId].waitingForAnswer = true;
-        await sendTelegramMessage(chatId, opening, false);
-      }
-
     } else {
       await sendTelegramMessage(chatId,
-        `Please reply with a number:\n\n1 — Gemini\n2 — DeepSeek\n3 — 🧠 Big Brain\n4 — 🌍 Naija Mode\n5 — 🎭 Story Mode\n6 — 🔥 Roast Battle`
+        `Reply with *1* for Gemini or *2* for DeepSeek to get started 👇`
       );
     }
     return;
   }
 
-  // ── Normal chat ──
+  // Message too long
   if (text.length > MAX_MESSAGE_LENGTH) {
-    await sendTelegramMessage(chatId, `Keep it under ${MAX_MESSAGE_LENGTH} characters please.`, false);
+    await sendTelegramMessage(chatId,
+      `Keep it under ${MAX_MESSAGE_LENGTH} characters please.`, false
+    );
     return;
   }
 
+  // Normal private conversation
   try {
-    const reply = await getChatReply(userId, text);
+    const reply = await getPrivateReply(userId, text);
     await sendTelegramMessage(chatId, reply, false);
-    console.log(`✅ Chat reply sent to ${username} via ${userAiSelection[userId]}`);
+    console.log(`✅ Private reply sent to ${username} via ${userAiSelection[userId]}`);
   } catch (err) {
-    console.error("❌ Error:", err.message);
-    await sendTelegramMessage(chatId, "Having some trouble right now. Give it a second and try again.", false);
+    console.error("❌ Private reply error:", err.message);
+    await sendTelegramMessage(chatId,
+      "Having some trouble right now. Give it a second and try again.", false
+    );
   }
 });
 
-// Manual test route
-app.post('/message', messageLimiter, async (req, res) => {
-  const { from, text } = req.body;
-  if (!from || !text) return res.status(400).json({ error: "Missing 'from' or 'text'" });
-  if (text.length > MAX_MESSAGE_LENGTH) return res.status(400).json({ error: "Message too long." });
-  if (!userAiSelection[from]) return res.status(400).json({ error: "No AI selected. Send 1-6 first." });
+// ═══════════════════════════════════════════════════════
+// WHATSAPP HANDLER (commented out — activate when ready)
+// ═══════════════════════════════════════════════════════
+
+/*
+
+// WhatsApp webhook verification
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) {
+    console.log('✅ WhatsApp webhook verified!');
+    return res.status(200).send(challenge);
+  }
+  res.sendStatus(403);
+});
+
+// WhatsApp webhook — receives incoming messages
+app.post('/webhook', async (req, res) => {
+  res.sendStatus(200);
+
+  const body = req.body;
+  if (body.object !== 'whatsapp_business_account') return;
+
+  const changes = body.entry?.[0]?.changes?.[0]?.value;
+  const message = changes?.messages?.[0];
+  if (!message || message.type !== 'text') return;
+
+  const from = message.from;
+  const text = message.text.body.trim();
+  const senderName = changes?.contacts?.[0]?.profile?.name || 'Friend';
+  const groupId = message?.context?.group_id || null;
+  const isGroup = !!groupId;
+
+  console.log(`📱 WhatsApp ${isGroup ? 'group' : 'private'} from ${senderName}: ${text}`);
+
+  // ── WhatsApp Group Handler ──
+  if (isGroup) {
+    // Respond only when "VibesAi" is mentioned OR replying to bot's message
+    const isMentioned = text.toLowerCase().includes('vibesai');
+    const isReply = !!message?.context?.id;
+
+    if (!isMentioned && !isReply) return;
+
+    const cleanText = text.replace(/vibesai/gi, '').trim();
+    if (!cleanText) {
+      await sendWhatsAppMessage(from, "You called? 👀 What's the debate?");
+      return;
+    }
+
+    try {
+      const groupName = 'WhatsApp Group';
+      const reply = await getGroupReply(groupId, groupName, senderName, cleanText);
+      await sendWhatsAppMessage(from, reply);
+      console.log(`✅ WhatsApp group reply sent`);
+    } catch (err) {
+      console.error("❌ WhatsApp group error:", err.message);
+      await sendWhatsAppMessage(from, "Having some trouble. Try again in a moment!");
+    }
+    return;
+  }
+
+  // ── WhatsApp Private Handler ──
+
+  // Greeting
+  if (isGreeting(text)) {
+    userAiSelection[from] = null;
+    privateConversations[from] = [];
+    await sendWhatsAppMessage(from,
+      `Hey ${senderName}! 👋 Welcome to VibesAi.\n\nChoose your AI:\n1️⃣ Gemini\n2️⃣ DeepSeek\n\nReply 1 or 2.`
+    );
+    return;
+  }
+
+  // AI selection
+  if (!userAiSelection[from]) {
+    if (text === '1') {
+      userAiSelection[from] = 'gemini';
+      await sendWhatsAppMessage(from, `✅ Gemini locked in. What's on your mind, ${senderName}?`);
+    } else if (text === '2') {
+      userAiSelection[from] = 'deepseek';
+      await sendWhatsAppMessage(from, `✅ DeepSeek locked in. What's on your mind, ${senderName}?`);
+    } else {
+      await sendWhatsAppMessage(from, "Reply 1 for Gemini or 2 for DeepSeek to get started.");
+    }
+    return;
+  }
+
+  if (text.length > MAX_MESSAGE_LENGTH) {
+    await sendWhatsAppMessage(from, `Keep it under ${MAX_MESSAGE_LENGTH} characters please.`);
+    return;
+  }
 
   try {
-    const reply = await getChatReply(from, text);
+    const reply = await getPrivateReply(from, text);
+    await sendWhatsAppMessage(from, reply);
+    console.log(`✅ WhatsApp private reply sent to ${senderName}`);
+  } catch (err) {
+    console.error("❌ WhatsApp error:", err.message);
+    await sendWhatsAppMessage(from, "Having some trouble. Try again in a moment!");
+  }
+});
+
+// Send WhatsApp message helper
+async function sendWhatsAppMessage(to, text) {
+  await axios.post(
+    `https://graph.facebook.com/v19.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: text }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+}
+
+*/
+
+// ─────────────────────────────────────────
+// MANUAL TEST ROUTE
+// ─────────────────────────────────────────
+app.post('/message', messageLimiter, async (req, res) => {
+  const { from, text } = req.body;
+
+  if (!from || !text) {
+    return res.status(400).json({ error: "Missing 'from' or 'text'" });
+  }
+
+  if (text.length > MAX_MESSAGE_LENGTH) {
+    return res.status(400).json({ error: "Message too long." });
+  }
+
+  if (!userAiSelection[from]) {
+    userAiSelection[from] = 'gemini'; // default for testing
+  }
+
+  try {
+    const reply = await getPrivateReply(from, text);
     res.json({ reply, ai: userAiSelection[from] });
   } catch (err) {
-    if (err.code === 'ECONNABORTED') return res.status(504).json({ error: "Timed out. Try again." });
+    if (err.code === 'ECONNABORTED') {
+      return res.status(504).json({ error: "Timed out. Try again." });
+    }
     console.error("Error:", err.response?.status, err.message);
     res.status(500).json({ error: "AI request failed." });
   }
 });
 
+// ─────────────────────────────────────────
+// START SERVER
+// ─────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`VibesAi Game Show running on port ${PORT} 🎮`));
+app.listen(PORT, () => console.log(`VibesAi running on port ${PORT} 🚀`));
