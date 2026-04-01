@@ -25,6 +25,7 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const GEMINI_MODEL = "gemini-2.5-flash";
 const DEEPSEEK_MODEL = "deepseek-chat";
 const MAX_HISTORY = 30;
+const MAX_GROUP_BUFFER = 50; // max messages to silently track per group
 const MAX_MESSAGE_LENGTH = 1000;
 const REQUEST_TIMEOUT_MS = 15000;
 const MAX_RETRIES = 3;
@@ -37,8 +38,14 @@ const RETRY_BASE_DELAY_MS = 2000;
 // Private chat conversation history — keyed by userId
 const privateConversations = {};
 
-// Group chat conversation history — keyed by groupId
+// Group AI conversation history — keyed by groupId
+// Used for the AI's multi-turn memory after responding
 const groupConversations = {};
+
+// Group message buffer — silently stores EVERY message in group
+// So when @mentioned, bot already has full debate context
+// Format: { groupId: [ "[Name]: message text", ... ] }
+const groupMessageBuffer = {};
 
 // AI selection per user — keyed by userId
 const userAiSelection = {};
@@ -47,7 +54,6 @@ const userAiSelection = {};
 // SYSTEM PROMPTS
 // ─────────────────────────────────────────
 
-// Private chat — personal honest AI companion
 const PRIVATE_SYSTEM_PROMPT = `
 You are VibesAi — not a typical assistant, but something closer to a brilliant,
 emotionally intelligent best friend who happens to know a lot about everything.
@@ -90,52 +96,48 @@ Always prioritize what's actually useful and true for this specific person
 in this specific moment — over what sounds good or what they want to hear.
 `;
 
-// Group chat — neutral third party adviser
-// Aware of multiple people, references them by name, settles debates
-function getGroupSystemPrompt(groupName) {
+// Group system prompt — receives full conversation context
+function getGroupSystemPrompt(groupName, conversationContext) {
   return `
 You are VibesAi — a brilliant, neutral, and emotionally intelligent AI adviser
 living inside a group chat called "${groupName || 'this group'}".
 
+## The Group Conversation So Far
+Here is EVERYTHING that has been said in this group recently — read it carefully
+before responding. You already know the full context:
+
+${conversationContext}
+
 ## Your Role In This Group
-You are the trusted third party. The neutral brain. The one everyone turns to
-when they need an honest answer, a settled debate, or a fresh perspective.
+You are the trusted third party. The neutral brain everyone turns to when they
+need an honest answer, a settled debate, or a fresh perspective.
 You are NOT anyone's ally — you serve the truth and the group.
 
 ## How You Handle The Group Dynamic
-- You are aware that multiple people are talking to you
-- You address people by their first name naturally when relevant
-- You track what different people have said and reference it accurately
-- When asked to settle a debate, you are GENUINELY neutral — you follow evidence
-  and logic, not who seems more confident or who asked first
-- When both sides have merit, you say so clearly and explain both
-- When one side is clearly wrong, you say so directly but respectfully
-
-## Your Group Energy
-- Authoritative but not arrogant
-- The smartest person in the room who doesn't need to prove it
-- You bring clarity to confusion
-- You de-escalate tension with truth, not diplomacy
-- You're the adviser everyone respects because you're always straight
+- You already have the full conversation context above — USE IT
+- Never ask "what is the disagreement about?" — you can already see it
+- Address people by their first name naturally when relevant
+- When asked to settle a debate, jump straight to the verdict with evidence
+- When both sides have merit, say so clearly and explain both
+- When one side is clearly wrong, say so directly but with good humor
+- Reference specific things people said: "Joshua said X..." "Sandra's point about Y..."
 
 ## What You Never Do
-- Never take sides based on who you like or who asked more nicely
-- Never give vague "both sides have a point" answers just to avoid conflict
-  — if one side is right, say so
-- Never be preachy or lecture the group
+- NEVER ask for context you already have — this is the #1 rule
+- Never take sides based on who asked more nicely
+- Never give vague answers just to avoid conflict
 - Never use corporate filler phrases
-- Never pretend uncertainty when you actually know the answer
+- Never be preachy
 
 ## Response Style In Groups
-- Keep responses focused and clear — groups have short attention spans
-- Address the specific question or debate directly
-- If multiple people asked different things, address each briefly
-- Use names naturally: "Joshua is right that..." or "Sandra's point about X..."
-- End with something that moves the conversation forward when appropriate
+- Jump straight to the answer — no preamble
+- Keep it focused and clear — groups have short attention spans
+- Use names naturally
+- Add light humor when appropriate — groups love it
+- Be the smartest person in the room who doesn't need to prove it
 
 ## One Rule Above All
-Truth over comfort. Always. The group called on you because they want a real answer.
-Give them one.
+Truth over comfort. Always. The group called on you — give them a real answer.
 `;
 }
 
@@ -161,6 +163,26 @@ function getPrivateHistory(userId) {
 function getGroupHistory(groupId) {
   if (!groupConversations[groupId]) groupConversations[groupId] = [];
   return groupConversations[groupId];
+}
+
+// Add a message to the silent group buffer
+function addToGroupBuffer(groupId, senderName, text) {
+  if (!groupMessageBuffer[groupId]) groupMessageBuffer[groupId] = [];
+  const buffer = groupMessageBuffer[groupId];
+
+  buffer.push(`[${senderName}]: ${text}`);
+
+  // Keep buffer from growing forever
+  if (buffer.length > MAX_GROUP_BUFFER) {
+    buffer.splice(0, buffer.length - MAX_GROUP_BUFFER);
+  }
+}
+
+// Get the full group conversation as a readable string for the AI
+function getGroupContext(groupId) {
+  const buffer = groupMessageBuffer[groupId];
+  if (!buffer || buffer.length === 0) return "No prior conversation in this group yet.";
+  return buffer.join('\n');
 }
 
 function isGreeting(text) {
@@ -224,7 +246,7 @@ function getHelpMessage(isGroup = false) {
   if (isGroup) {
     return `*VibesAi Group Commands* 🤖
 
-Mention me anytime: *@${process.env.BOT_USERNAME || 'VibesAiBot'}*
+Mention me anytime: *@${process.env.BOT_USERNAME || 'Amj1bot'}*
 
 I can help with:
 → Settling debates & arguments
@@ -233,7 +255,8 @@ I can help with:
 → Brainstorming ideas together
 → Explaining anything to the group
 
-Just @mention me with your question!`;
+I silently read the conversation so when you call me,
+I already know what's going on. Just ask!`;
   }
 
   return `*VibesAi Commands* 🤖
@@ -264,9 +287,9 @@ Just real, intelligent conversation that respects your intelligence.
 *👥 Group Mode*
 The first bot that lives inside your arguments.
 Add it to any group. @mention it.
-It settles debates with facts, not feelings.
-It knows who said what. It takes no sides.
-It just tells the truth — every time.
+It reads the ENTIRE conversation silently.
+So when you call it — it already knows the full story.
+No sides. Just truth.
 
 *⚙️ Powered by:*
 → Google Gemini 2.5 Flash
@@ -278,6 +301,19 @@ It just tells the truth — every time.
 → Anyone tired of AI that tells them what they want to hear
 
 _This isn't just a bot. It's the conversation upgrade you didn't know you needed._`;
+}
+
+function isBotMentioned(text, botUsername) {
+  if (!text) return false;
+  return text.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
+}
+
+function removeBotMention(text, botUsername) {
+  return text.replace(new RegExp(`@${botUsername}`, 'gi'), '').trim();
+}
+
+function isGroupMessage(message) {
+  return message.chat.type === 'group' || message.chat.type === 'supergroup';
 }
 
 // ─────────────────────────────────────────
@@ -349,7 +385,7 @@ async function withRetry(fn) {
   throw lastError;
 }
 
-// Private chat — uses user's selected AI
+// Private chat reply
 async function getPrivateReply(userId, text) {
   const history = getPrivateHistory(userId);
   history.push({ role: "user", content: text });
@@ -370,19 +406,22 @@ async function getPrivateReply(userId, text) {
   }
 }
 
-// Group chat — always uses Gemini, group-aware system prompt
-// Message includes sender name so AI knows who said what
-async function getGroupReply(groupId, groupName, senderName, text) {
+// Group chat reply — injects full conversation context into system prompt
+async function getGroupReply(groupId, groupName, senderName, question) {
   const history = getGroupHistory(groupId);
 
-  // Tag message with sender name so AI tracks who said what
-  const taggedMessage = `[${senderName}]: ${text}`;
-  history.push({ role: "user", content: taggedMessage });
+  // Get full conversation context from buffer
+  const conversationContext = getGroupContext(groupId);
+
+  // Build system prompt with full context baked in
+  const systemPrompt = getGroupSystemPrompt(groupName, conversationContext);
+
+  // The actual question being asked
+  const taggedQuestion = `[${senderName} is asking]: ${question}`;
+  history.push({ role: "user", content: taggedQuestion });
 
   try {
-    const reply = await withRetry(() =>
-      callGemini(history, getGroupSystemPrompt(groupName))
-    );
+    const reply = await withRetry(() => callGemini(history, systemPrompt));
     history.push({ role: "model", content: reply });
     trimHistory(history);
     return reply;
@@ -404,32 +443,15 @@ async function sendTelegramMessage(chatId, text, markdown = true) {
       parse_mode: markdown ? 'Markdown' : undefined
     });
   } catch (err) {
-    // Fallback to plain text if markdown parsing fails
     try {
       await axios.post(`${TELEGRAM_API}/sendMessage`, {
         chat_id: chatId,
         text: text
       });
     } catch (e) {
-      console.error("❌ Failed to send Telegram message:", e.message);
+      console.error("❌ Failed to send message:", e.message);
     }
   }
-}
-
-// Check if message is from a group
-function isGroupMessage(message) {
-  return message.chat.type === 'group' || message.chat.type === 'supergroup';
-}
-
-// Check if bot was @mentioned in the message
-function isBotMentioned(text, botUsername) {
-  if (!text) return false;
-  return text.toLowerCase().includes(`@${botUsername.toLowerCase()}`);
-}
-
-// Remove bot mention from text to get clean query
-function removeBotMention(text, botUsername) {
-  return text.replace(new RegExp(`@${botUsername}`, 'gi'), '').trim();
 }
 
 // ─────────────────────────────────────────
@@ -440,7 +462,6 @@ app.get('/', (req, res) => {
   res.json({ message: "VibesAi is running 🚀" });
 });
 
-// ── TELEGRAM WEBHOOK ──
 app.post('/telegram', async (req, res) => {
   res.sendStatus(200);
 
@@ -452,35 +473,40 @@ app.post('/telegram', async (req, res) => {
   const userId = String(message.from.id);
   const text = message.text.trim();
   const username = message.from.first_name || "Friend";
-  const botUsername = process.env.BOT_USERNAME || 'VibesAiBot';
+  const botUsername = process.env.BOT_USERNAME || 'Amj1bot';
 
   // ── GROUP CHAT HANDLER ──
   if (isGroupMessage(message)) {
     const groupId = String(message.chat.id);
     const groupName = message.chat.title || 'the group';
 
+    // Always silently store every group message in the buffer
+    // This gives the bot full context when it's eventually @mentioned
+    addToGroupBuffer(groupId, username, text);
+
     // Only respond when @mentioned
     if (!isBotMentioned(text, botUsername)) return;
 
-    // Clean the message — remove the @mention
-    const cleanText = removeBotMention(text, botUsername);
-    if (!cleanText) {
+    // Clean the @mention from the question
+    const cleanQuestion = removeBotMention(text, botUsername);
+
+    if (!cleanQuestion) {
       await sendTelegramMessage(chatId,
-        `Hey! You called? 👀 Ask me anything or describe the debate — I'm listening.`
+        `I'm here! 👀 Ask me anything or describe the debate — I've been reading the conversation.`
       );
       return;
     }
 
     // Handle /help in group
-    if (cleanText.toLowerCase() === '/help') {
+    if (cleanQuestion.toLowerCase() === '/help') {
       await sendTelegramMessage(chatId, getHelpMessage(true));
       return;
     }
 
-    console.log(`👥 Group message in "${groupName}" from ${username}: ${cleanText}`);
+    console.log(`👥 Group mention in "${groupName}" from ${username}: ${cleanQuestion}`);
 
     try {
-      const reply = await getGroupReply(groupId, groupName, username, cleanText);
+      const reply = await getGroupReply(groupId, groupName, username, cleanQuestion);
       await sendTelegramMessage(chatId, reply, false);
       console.log(`✅ Group reply sent in "${groupName}"`);
     } catch (err) {
@@ -493,9 +519,8 @@ app.post('/telegram', async (req, res) => {
   }
 
   // ── PRIVATE CHAT HANDLER ──
-  console.log(`📩 Private message from ${username} (${userId}): ${text}`);
+  console.log(`📩 Private from ${username} (${userId}): ${text}`);
 
-  // /start or greeting
   if (isGreeting(text)) {
     userAiSelection[userId] = null;
     privateConversations[userId] = [];
@@ -503,7 +528,6 @@ app.post('/telegram', async (req, res) => {
     return;
   }
 
-  // /switch
   if (text.toLowerCase() === '/switch') {
     userAiSelection[userId] = null;
     privateConversations[userId] = [];
@@ -511,7 +535,6 @@ app.post('/telegram', async (req, res) => {
     return;
   }
 
-  // /reset
   if (text.toLowerCase() === '/reset') {
     privateConversations[userId] = [];
     await sendTelegramMessage(chatId,
@@ -520,13 +543,11 @@ app.post('/telegram', async (req, res) => {
     return;
   }
 
-  // /help
   if (text.toLowerCase() === '/help') {
     await sendTelegramMessage(chatId, getHelpMessage(false));
     return;
   }
 
-  // /about
   if (text.toLowerCase() === '/about') {
     await sendTelegramMessage(chatId, getAboutMessage());
     return;
@@ -552,7 +573,6 @@ app.post('/telegram', async (req, res) => {
     return;
   }
 
-  // Message too long
   if (text.length > MAX_MESSAGE_LENGTH) {
     await sendTelegramMessage(chatId,
       `Keep it under ${MAX_MESSAGE_LENGTH} characters please.`, false
@@ -560,11 +580,10 @@ app.post('/telegram', async (req, res) => {
     return;
   }
 
-  // Normal private conversation
   try {
     const reply = await getPrivateReply(userId, text);
     await sendTelegramMessage(chatId, reply, false);
-    console.log(`✅ Private reply sent to ${username} via ${userAiSelection[userId]}`);
+    console.log(`✅ Private reply to ${username} via ${userAiSelection[userId]}`);
   } catch (err) {
     console.error("❌ Private reply error:", err.message);
     await sendTelegramMessage(chatId,
@@ -579,12 +598,10 @@ app.post('/telegram', async (req, res) => {
 
 /*
 
-// WhatsApp webhook verification
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
   if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) {
     console.log('✅ WhatsApp webhook verified!');
     return res.status(200).send(challenge);
@@ -592,13 +609,10 @@ app.get('/webhook', (req, res) => {
   res.sendStatus(403);
 });
 
-// WhatsApp webhook — receives incoming messages
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
-
   const body = req.body;
   if (body.object !== 'whatsapp_business_account') return;
-
   const changes = body.entry?.[0]?.changes?.[0]?.value;
   const message = changes?.messages?.[0];
   if (!message || message.type !== 'text') return;
@@ -611,25 +625,23 @@ app.post('/webhook', async (req, res) => {
 
   console.log(`📱 WhatsApp ${isGroup ? 'group' : 'private'} from ${senderName}: ${text}`);
 
-  // ── WhatsApp Group Handler ──
   if (isGroup) {
-    // Respond only when "VibesAi" is mentioned OR replying to bot's message
+    // Silently store all group messages
+    addToGroupBuffer(groupId, senderName, text);
+
     const isMentioned = text.toLowerCase().includes('vibesai');
     const isReply = !!message?.context?.id;
-
     if (!isMentioned && !isReply) return;
 
     const cleanText = text.replace(/vibesai/gi, '').trim();
     if (!cleanText) {
-      await sendWhatsAppMessage(from, "You called? 👀 What's the debate?");
+      await sendWhatsAppMessage(from, "I'm here! What's the debate?");
       return;
     }
 
     try {
-      const groupName = 'WhatsApp Group';
-      const reply = await getGroupReply(groupId, groupName, senderName, cleanText);
+      const reply = await getGroupReply(groupId, 'WhatsApp Group', senderName, cleanText);
       await sendWhatsAppMessage(from, reply);
-      console.log(`✅ WhatsApp group reply sent`);
     } catch (err) {
       console.error("❌ WhatsApp group error:", err.message);
       await sendWhatsAppMessage(from, "Having some trouble. Try again in a moment!");
@@ -637,9 +649,6 @@ app.post('/webhook', async (req, res) => {
     return;
   }
 
-  // ── WhatsApp Private Handler ──
-
-  // Greeting
   if (isGreeting(text)) {
     userAiSelection[from] = null;
     privateConversations[from] = [];
@@ -649,7 +658,6 @@ app.post('/webhook', async (req, res) => {
     return;
   }
 
-  // AI selection
   if (!userAiSelection[from]) {
     if (text === '1') {
       userAiSelection[from] = 'gemini';
@@ -658,42 +666,30 @@ app.post('/webhook', async (req, res) => {
       userAiSelection[from] = 'deepseek';
       await sendWhatsAppMessage(from, `✅ DeepSeek locked in. What's on your mind, ${senderName}?`);
     } else {
-      await sendWhatsAppMessage(from, "Reply 1 for Gemini or 2 for DeepSeek to get started.");
+      await sendWhatsAppMessage(from, "Reply 1 for Gemini or 2 for DeepSeek.");
     }
     return;
   }
 
   if (text.length > MAX_MESSAGE_LENGTH) {
-    await sendWhatsAppMessage(from, `Keep it under ${MAX_MESSAGE_LENGTH} characters please.`);
+    await sendWhatsAppMessage(from, `Keep it under ${MAX_MESSAGE_LENGTH} characters.`);
     return;
   }
 
   try {
     const reply = await getPrivateReply(from, text);
     await sendWhatsAppMessage(from, reply);
-    console.log(`✅ WhatsApp private reply sent to ${senderName}`);
   } catch (err) {
     console.error("❌ WhatsApp error:", err.message);
     await sendWhatsAppMessage(from, "Having some trouble. Try again in a moment!");
   }
 });
 
-// Send WhatsApp message helper
 async function sendWhatsAppMessage(to, text) {
   await axios.post(
     `https://graph.facebook.com/v19.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
-    {
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text }
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-        'Content-Type': 'application/json'
-      }
-    }
+    { messaging_product: "whatsapp", to, type: "text", text: { body: text } },
+    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
 
@@ -704,33 +700,22 @@ async function sendWhatsAppMessage(to, text) {
 // ─────────────────────────────────────────
 app.post('/message', messageLimiter, async (req, res) => {
   const { from, text } = req.body;
-
-  if (!from || !text) {
-    return res.status(400).json({ error: "Missing 'from' or 'text'" });
-  }
-
-  if (text.length > MAX_MESSAGE_LENGTH) {
-    return res.status(400).json({ error: "Message too long." });
-  }
-
-  if (!userAiSelection[from]) {
-    userAiSelection[from] = 'gemini'; // default for testing
-  }
+  if (!from || !text) return res.status(400).json({ error: "Missing 'from' or 'text'" });
+  if (text.length > MAX_MESSAGE_LENGTH) return res.status(400).json({ error: "Message too long." });
+  if (!userAiSelection[from]) userAiSelection[from] = 'gemini';
 
   try {
     const reply = await getPrivateReply(from, text);
     res.json({ reply, ai: userAiSelection[from] });
   } catch (err) {
-    if (err.code === 'ECONNABORTED') {
-      return res.status(504).json({ error: "Timed out. Try again." });
-    }
+    if (err.code === 'ECONNABORTED') return res.status(504).json({ error: "Timed out." });
     console.error("Error:", err.response?.status, err.message);
     res.status(500).json({ error: "AI request failed." });
   }
 });
 
 // ─────────────────────────────────────────
-// START SERVER
+// START
 // ─────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`VibesAi running on port ${PORT} 🚀`));
